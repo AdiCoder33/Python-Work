@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+openpyxl
+passlib[bcrypt]
+python-jose[cryptography]
+filelock
