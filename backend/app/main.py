@@ -18,6 +18,7 @@ from .excel_store import (
     ensure_tasks_file,
     ensure_users_file,
     find_user,
+    list_users,
     list_tasks,
     update_last_login,
     update_user_password,
@@ -43,6 +44,7 @@ from .models import (
     TokenResponse,
     SubDivisionTotals,
     UserStatusRequest,
+    UserRecord,
 )
 from .rate_limit import RateLimiter
 from .config import BACKUP_RETENTION_DAYS
@@ -325,6 +327,20 @@ def login(payload: LoginRequest, request: Request):
     return TokenResponse(access_token=token, role=user["role"], username=user["username"])
 
 
+@app.get("/admin/users", response_model=list[UserRecord])
+def get_users(
+    request: Request,
+    user=Depends(require_admin),
+    q: str | None = Query(None),
+    role: str | None = Query(None),
+    is_active: int | None = Query(None, ge=0, le=1),
+):
+    if role not in (None, "", "admin", "user"):
+        raise ApiError("VALIDATION_ERROR", "Invalid role.", status.HTTP_400_BAD_REQUEST)
+    users = list_users(q=q, role=role, is_active=is_active)
+    return [UserRecord(**item) for item in users]
+
+
 @app.post("/admin/users", response_model=CreateUserResponse)
 def create_user(payload: CreateUserRequest, request: Request, user=Depends(require_admin)):
     trace_id, ip, user_agent = get_request_meta(request)
@@ -370,19 +386,19 @@ def create_user(payload: CreateUserRequest, request: Request, user=Depends(requi
     return CreateUserResponse(user_id=user_id, username=payload.username, role=payload.role)
 
 
-@app.patch("/admin/users/status")
+@app.patch("/admin/users/{username}/status")
 def update_user_active_status(
-    payload: UserStatusRequest, request: Request, user=Depends(require_admin)
+    username: str, payload: UserStatusRequest, request: Request, user=Depends(require_admin)
 ):
     trace_id, ip, user_agent = get_request_meta(request)
-    updated = update_user_status(payload.username, payload.is_active)
+    updated = update_user_status(username, payload.is_active)
     if not updated:
         log_event(
             action="admin.user_disable_enable",
             actor=user["username"],
             role=user["role"],
             status="failed",
-            metadata={"reason": "user_not_found", "target_username": payload.username},
+            metadata={"reason": "user_not_found", "target_username": username},
             trace_id=trace_id,
             ip=ip,
             user_agent=user_agent,
@@ -396,7 +412,7 @@ def update_user_active_status(
         role=user["role"],
         status="success",
         metadata={
-            "target_username": payload.username,
+            "target_username": username,
             "is_active": payload.is_active,
         },
         trace_id=trace_id,
@@ -407,20 +423,20 @@ def update_user_active_status(
     return {"status": "success"}
 
 
-@app.post("/admin/users/reset-password")
+@app.post("/admin/users/{username}/reset-password")
 def reset_password(
-    payload: PasswordResetRequest, request: Request, user=Depends(require_admin)
+    username: str, payload: PasswordResetRequest, request: Request, user=Depends(require_admin)
 ):
     trace_id, ip, user_agent = get_request_meta(request)
     password_hash = hash_password(payload.new_password)
-    updated = update_user_password(payload.username, password_hash)
+    updated = update_user_password(username, password_hash)
     if not updated:
         log_event(
             action="admin.password_reset",
             actor=user["username"],
             role=user["role"],
             status="failed",
-            metadata={"reason": "user_not_found", "target_username": payload.username},
+            metadata={"reason": "user_not_found", "target_username": username},
             trace_id=trace_id,
             ip=ip,
             user_agent=user_agent,
@@ -433,7 +449,7 @@ def reset_password(
         actor=user["username"],
         role=user["role"],
         status="success",
-        metadata={"target_username": payload.username},
+        metadata={"target_username": username},
         trace_id=trace_id,
         ip=ip,
         user_agent=user_agent,

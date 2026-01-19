@@ -90,10 +90,14 @@ GET /admin/export?sort_by=created_at&order=desc&account_code=New
 
 These endpoints are admin-only and are used for safety operations and audit logging:
 
-- `PATCH /admin/users/status`
-  - Body: `{"username": "...", "is_active": 0|1}`
-- `POST /admin/users/reset-password`
-  - Body: `{"username": "...", "new_password": "..." }`
+- `GET /admin/users`
+  - Query params: `q`, `role`, `is_active`
+- `POST /admin/users`
+  - Body: `{"username": "...", "password": "...", "role": "admin|user"}`
+- `PATCH /admin/users/{username}/status`
+  - Body: `{"is_active": 0|1}`
+- `POST /admin/users/{username}/reset-password`
+  - Body: `{"new_password": "..."}`
 
 ## Reliability and safety (Phase 4A)
 

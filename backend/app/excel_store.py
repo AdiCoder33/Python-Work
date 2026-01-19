@@ -130,6 +130,17 @@ def _normalize_user_row(row_data: dict) -> dict:
     return row_data
 
 
+def _public_user_row(row_data: dict) -> dict:
+    return {
+        "user_id": row_data.get("user_id", ""),
+        "username": row_data.get("username", ""),
+        "role": row_data.get("role", ""),
+        "is_active": int(row_data.get("is_active") or 0),
+        "created_at": row_data.get("created_at", ""),
+        "last_login_at": row_data.get("last_login_at", ""),
+    }
+
+
 def find_user(username: str):
     ensure_users_file()
     with FileLock(str(USERS_LOCK)):
@@ -142,6 +153,28 @@ def find_user(username: str):
             if row_data.get("username") == username:
                 return _normalize_user_row(row_data)
     return None
+
+
+def list_users(q: str | None = None, role: str | None = None, is_active: int | None = None):
+    ensure_users_file()
+    query = (q or "").strip().lower()
+    with FileLock(str(USERS_LOCK)):
+        wb = load_workbook(USERS_FILE)
+        ws = wb["users"]
+        results = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not any(row):
+                continue
+            row_data = _normalize_user_row(dict(zip(USER_COLUMNS, row)))
+            username = row_data.get("username", "")
+            if query and query not in username.lower():
+                continue
+            if role and row_data.get("role") != role:
+                continue
+            if is_active is not None and int(row_data.get("is_active", 0)) != is_active:
+                continue
+            results.append(_public_user_row(row_data))
+        return results
 
 
 def append_user(user_data: dict):

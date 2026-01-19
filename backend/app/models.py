@@ -40,12 +40,10 @@ class TaskCreateRequest(BaseModel):
 
 
 class UserStatusRequest(BaseModel):
-    username: str = Field(..., min_length=1)
     is_active: int = Field(..., ge=0, le=1)
 
 
 class PasswordResetRequest(BaseModel):
-    username: str = Field(..., min_length=1)
     new_password: str = Field(..., min_length=6)
 
 
@@ -80,6 +78,15 @@ class TaskRecord(BaseModel):
     balance_works: int
     created_by: str
     created_at: str
+
+
+class UserRecord(BaseModel):
+    user_id: str
+    username: str
+    role: Literal["admin", "user"]
+    is_active: int
+    created_at: str
+    last_login_at: str
 
 
 class AdminTasksResponse(BaseModel):
