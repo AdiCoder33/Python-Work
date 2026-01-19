@@ -86,6 +86,35 @@ Example:
 GET /admin/export?sort_by=created_at&order=desc&account_code=New
 ```
 
+## Admin user maintenance
+
+These endpoints are admin-only and are used for safety operations and audit logging:
+
+- `PATCH /admin/users/status`
+  - Body: `{"username": "...", "is_active": 0|1}`
+- `POST /admin/users/reset-password`
+  - Body: `{"username": "...", "new_password": "..." }`
+
+## Reliability and safety (Phase 4A)
+
+- Crash-safe writes: Excel files are saved using a temp file + fsync + atomic replace.
+- Daily backups: the server creates a backup folder under `backend/data/backups/` once per day.
+  - Folder name format: `YYYY-MM-DDTHH-MM-SS`
+  - Backups include `users.xlsx`, `tasks.xlsx`, and `audit.log`
+  - Retains the last `BACKUP_RETENTION_DAYS` (default 30)
+- Export backups: `/admin/export` creates a backup snapshot of `tasks.xlsx` before exporting.
+- Audit log: append-only JSONL file at `backend/data/audit/audit.log` (protected by `audit.lock`).
+- Rate limiting: `/auth/login` is rate-limited per IP and per username in memory.
+
+Important: rate limiting is per process. Run Uvicorn with a single worker for consistent behavior:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+Optional environment variable:
+- `BACKUP_RETENTION_DAYS` (default 30)
+
 ## Deployment notes
 
 - Use a VM or any server with a persistent disk.

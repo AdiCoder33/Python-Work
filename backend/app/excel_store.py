@@ -90,9 +90,12 @@ def ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def safe_save(workbook, path: Path):
+def safe_save_workbook(workbook, path: Path):
     tmp_path = path.with_name(path.name + ".tmp")
-    workbook.save(str(tmp_path))
+    with open(tmp_path, "wb") as handle:
+        workbook.save(handle)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(str(tmp_path), str(path))
 
 
@@ -103,7 +106,7 @@ def ensure_users_file():
         ws = wb.active
         ws.title = "users"
         ws.append(USER_COLUMNS)
-        safe_save(wb, USERS_FILE)
+        safe_save_workbook(wb, USERS_FILE)
 
 
 def ensure_tasks_file():
@@ -113,7 +116,7 @@ def ensure_tasks_file():
         ws = wb.active
         ws.title = "tasks"
         ws.append(TASK_COLUMNS)
-        safe_save(wb, TASKS_FILE)
+        safe_save_workbook(wb, TASKS_FILE)
 
 
 def _normalize_user_row(row_data: dict) -> dict:
@@ -150,7 +153,7 @@ def append_user(user_data: dict):
             if row and row[1] == user_data["username"]:
                 raise ValueError("Username already exists.")
         ws.append([user_data.get(col, "") for col in USER_COLUMNS])
-        safe_save(wb, USERS_FILE)
+        safe_save_workbook(wb, USERS_FILE)
 
 
 def update_last_login(username: str, last_login_at: str):
@@ -163,7 +166,37 @@ def update_last_login(username: str, last_login_at: str):
         for row in range(2, ws.max_row + 1):
             if ws.cell(row=row, column=username_col).value == username:
                 ws.cell(row=row, column=login_col).value = last_login_at
-                safe_save(wb, USERS_FILE)
+                safe_save_workbook(wb, USERS_FILE)
+                return True
+    return False
+
+
+def update_user_status(username: str, is_active: int):
+    ensure_users_file()
+    with FileLock(str(USERS_LOCK)):
+        wb = load_workbook(USERS_FILE)
+        ws = wb["users"]
+        username_col = USER_COLUMNS.index("username") + 1
+        active_col = USER_COLUMNS.index("is_active") + 1
+        for row in range(2, ws.max_row + 1):
+            if ws.cell(row=row, column=username_col).value == username:
+                ws.cell(row=row, column=active_col).value = int(is_active)
+                safe_save_workbook(wb, USERS_FILE)
+                return True
+    return False
+
+
+def update_user_password(username: str, password_hash: str):
+    ensure_users_file()
+    with FileLock(str(USERS_LOCK)):
+        wb = load_workbook(USERS_FILE)
+        ws = wb["users"]
+        username_col = USER_COLUMNS.index("username") + 1
+        pass_col = USER_COLUMNS.index("password_hash") + 1
+        for row in range(2, ws.max_row + 1):
+            if ws.cell(row=row, column=username_col).value == username:
+                ws.cell(row=row, column=pass_col).value = password_hash
+                safe_save_workbook(wb, USERS_FILE)
                 return True
     return False
 
@@ -189,7 +222,7 @@ def append_task(task_data: dict) -> int:
         task_row = dict(task_data)
         task_row["sno"] = sno
         ws.append([task_row.get(col, "") for col in TASK_COLUMNS])
-        safe_save(wb, TASKS_FILE)
+        safe_save_workbook(wb, TASKS_FILE)
         return sno
 
 
@@ -239,4 +272,4 @@ def copy_tasks_backup(backup_path: Path | None = None):
         backup_path = DATA_DIR / "tasks_backup.xlsx"
     with FileLock(str(TASKS_LOCK)):
         wb = load_workbook(TASKS_FILE)
-        safe_save(wb, backup_path)
+        safe_save_workbook(wb, backup_path)

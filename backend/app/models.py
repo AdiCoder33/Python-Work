@@ -39,6 +39,16 @@ class TaskCreateRequest(BaseModel):
     works_completed: int = Field(..., ge=0)
 
 
+class UserStatusRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    is_active: int = Field(..., ge=0, le=1)
+
+
+class PasswordResetRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6)
+
+
 class ComputedFields(BaseModel):
     balance_amount_as_on_01_04_2025: float
     total_exp_during_year: float
@@ -108,3 +118,14 @@ class SubDivisionTotals(BaseModel):
 class SummaryResponse(BaseModel):
     grand_totals: Totals
     by_sub_division: list[SubDivisionTotals]
+
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+    field_errors: dict[str, str] | None = None
+
+
+class ErrorResponse(BaseModel):
+    trace_id: str
+    error: ErrorDetail

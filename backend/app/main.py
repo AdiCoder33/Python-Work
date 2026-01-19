@@ -1,11 +1,16 @@
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+import threading
+import time
 import uuid
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .auth import create_access_token, hash_password, verify_password
+from .audit import log_event, ensure_audit_file
+from .backup import run_daily_backup, run_export_backup
 from .deps import require_admin, require_auth
 from .excel_store import (
     append_task,
@@ -14,12 +19,14 @@ from .excel_store import (
     ensure_users_file,
     find_user,
     list_tasks,
-    copy_tasks_backup,
     update_last_login,
+    update_user_password,
+    update_user_status,
     TASK_COLUMN_DEFS,
     TASK_COLUMNS,
     TASK_TOTAL_COLUMNS,
 )
+from .errors import ApiError, error_payload
 from .models import (
     AdminTasksResponse,
     AccountCodeTotals,
@@ -27,6 +34,7 @@ from .models import (
     CreateUserRequest,
     CreateUserResponse,
     LoginRequest,
+    PasswordResetRequest,
     SummaryResponse,
     TaskCreateRequest,
     TaskCreateResponse,
@@ -34,15 +42,120 @@ from .models import (
     Totals,
     TokenResponse,
     SubDivisionTotals,
+    UserStatusRequest,
 )
+from .rate_limit import RateLimiter
+from .config import BACKUP_RETENTION_DAYS
 
 
-app = FastAPI(title="Capital Works API")
 COLUMN_DEF_MAP = {col["name"]: col for col in TASK_COLUMN_DEFS}
 
+app = FastAPI(title="Capital Works API")
+rate_limiter = RateLimiter()
+_backup_state = {"last_date": None, "started": False}
 
+
+def get_request_meta(request: Request):
+    trace_id = getattr(request.state, "trace_id", "")
+    ip = request.client.host if request.client else ""
+    user_agent = request.headers.get("user-agent", "")
+    return trace_id, ip, user_agent
+
+
+def build_error_response(request: Request, code: str, message: str, status_code: int, field_errors=None):
+    trace_id = getattr(request.state, "trace_id", "")
+    payload = error_payload(trace_id, code, message, field_errors)
+    return JSONResponse(
+        status_code=status_code,
+        content=payload,
+        headers={"X-Trace-Id": trace_id},
+    )
+
+
+def map_status_to_code(status_code: int):
+    if status_code == status.HTTP_400_BAD_REQUEST:
+        return "VALIDATION_ERROR"
+    if status_code == status.HTTP_401_UNAUTHORIZED:
+        return "AUTH_FAILED"
+    if status_code == status.HTTP_403_FORBIDDEN:
+        return "NOT_AUTHORIZED"
+    if status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+        return "RATE_LIMITED"
+    return "INTERNAL_ERROR"
+
+
+@app.middleware("http")
+async def trace_id_middleware(request: Request, call_next):
+    trace_id = str(uuid.uuid4())
+    request.state.trace_id = trace_id
+    response = await call_next(request)
+    response.headers["X-Trace-Id"] = trace_id
+    return response
+
+
+@app.exception_handler(ApiError)
+async def api_error_handler(request: Request, exc: ApiError):
+    return build_error_response(request, exc.code, exc.message, exc.status_code, exc.field_errors)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    code = map_status_to_code(exc.status_code)
+    message = str(exc.detail)
+    field_errors = None
+    if isinstance(exc.detail, dict):
+        message = exc.detail.get("message") or exc.detail.get("detail") or message
+        field_errors = exc.detail.get("field_errors")
+        if exc.detail.get("code"):
+            code = exc.detail.get("code")
+    return build_error_response(request, code, message, exc.status_code, field_errors)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    field_errors = {}
+    for err in exc.errors():
+        loc = err.get("loc", [])
+        parts = [str(part) for part in loc if part not in ("body", "query", "path")]
+        key = ".".join(parts) if parts else "non_field"
+        field_errors[key] = err.get("msg", "Invalid value")
+    return build_error_response(
+        request,
+        "VALIDATION_ERROR",
+        "Validation error.",
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        field_errors,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return build_error_response(
+        request, "INTERNAL_ERROR", "Internal server error.", status.HTTP_500_INTERNAL_SERVER_ERROR
+    )
 def iso_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def backup_scheduler_loop():
+    while True:
+        try:
+            today = datetime.now().date()
+            last_date = _backup_state.get("last_date")
+            if last_date != today:
+                run_daily_backup(BACKUP_RETENTION_DAYS)
+                _backup_state["last_date"] = today
+        except Exception:
+            pass
+        time.sleep(3600)
+
+
+def start_backup_scheduler():
+    if _backup_state.get("started"):
+        return
+    _backup_state["started"] = True
+    thread = threading.Thread(target=backup_scheduler_loop, daemon=True)
+    thread.start()
 
 def parse_datetime_value(value: str):
     if not value:
@@ -93,7 +206,7 @@ def apply_filters(records, sub_division, account_code, date_from, date_to):
 
 def sort_records(records, sort_by, order):
     if sort_by not in COLUMN_DEF_MAP:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid sort_by.")
+        raise ApiError("VALIDATION_ERROR", "Invalid sort_by.", status.HTTP_400_BAD_REQUEST)
     reverse = order == "desc"
     col_def = COLUMN_DEF_MAP[sort_by]
 
@@ -138,36 +251,90 @@ def totals_to_model(data):
 def startup():
     ensure_users_file()
     ensure_tasks_file()
+    ensure_audit_file()
+    start_backup_scheduler()
 
 
 @app.post("/auth/login", response_model=TokenResponse)
-def login(request: LoginRequest):
-    user = find_user(request.username)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+def login(payload: LoginRequest, request: Request):
+    trace_id, ip, user_agent = get_request_meta(request)
+    allowed, reason = rate_limiter.check_and_add(payload.username, ip)
+    if not allowed:
+        log_event(
+            action="auth.login_failed",
+            actor=payload.username,
+            role="",
+            status="rate_limited",
+            metadata={"reason": reason},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise ApiError(
+            "RATE_LIMITED",
+            "Too many login attempts. Try again later.",
+            status.HTTP_429_TOO_MANY_REQUESTS,
+        )
 
-    if not verify_password(request.password, user["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    user = find_user(payload.username)
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        log_event(
+            action="auth.login_failed",
+            actor=payload.username,
+            role="",
+            status="failed",
+            metadata={"reason": "invalid_credentials"},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise ApiError("AUTH_FAILED", "Invalid credentials.", status.HTTP_401_UNAUTHORIZED)
 
     if int(user.get("is_active", 0)) != 1:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
+        log_event(
+            action="auth.login_failed",
+            actor=payload.username,
+            role=user.get("role", ""),
+            status="failed",
+            metadata={"reason": "inactive"},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise ApiError("NOT_AUTHORIZED", "User is inactive.", status.HTTP_403_FORBIDDEN)
 
     last_login = iso_now()
-    update_last_login(request.username, last_login)
+    update_last_login(payload.username, last_login)
+    rate_limiter.reset_username(payload.username)
 
     token = create_access_token({"sub": user["username"], "role": user["role"]})
+    log_event(
+        action="auth.login_success",
+        actor=user["username"],
+        role=user["role"],
+        status="success",
+        metadata={},
+        trace_id=trace_id,
+        ip=ip,
+        user_agent=user_agent,
+        ts=iso_now(),
+    )
     return TokenResponse(access_token=token, role=user["role"], username=user["username"])
 
 
 @app.post("/admin/users", response_model=CreateUserResponse)
-def create_user(request: CreateUserRequest, user=Depends(require_admin)):
+def create_user(payload: CreateUserRequest, request: Request, user=Depends(require_admin)):
+    trace_id, ip, user_agent = get_request_meta(request)
     user_id = str(uuid.uuid4())
     created_at = iso_now()
     new_user = {
         "user_id": user_id,
-        "username": request.username,
-        "password_hash": hash_password(request.password),
-        "role": request.role,
+        "username": payload.username,
+        "password_hash": hash_password(payload.password),
+        "role": payload.role,
         "is_active": 1,
         "created_at": created_at,
         "last_login_at": "",
@@ -175,62 +342,199 @@ def create_user(request: CreateUserRequest, user=Depends(require_admin)):
     try:
         append_user(new_user)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        log_event(
+            action="admin.user_create",
+            actor=user["username"],
+            role=user["role"],
+            status="failed",
+            metadata={"reason": str(exc), "target_username": payload.username},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise ApiError("VALIDATION_ERROR", str(exc), status.HTTP_409_CONFLICT) from exc
 
-    return CreateUserResponse(user_id=user_id, username=request.username, role=request.role)
+    log_event(
+        action="admin.user_create",
+        actor=user["username"],
+        role=user["role"],
+        status="success",
+        metadata={"target_username": payload.username, "role": payload.role},
+        trace_id=trace_id,
+        ip=ip,
+        user_agent=user_agent,
+        ts=iso_now(),
+    )
+
+    return CreateUserResponse(user_id=user_id, username=payload.username, role=payload.role)
+
+
+@app.patch("/admin/users/status")
+def update_user_active_status(
+    payload: UserStatusRequest, request: Request, user=Depends(require_admin)
+):
+    trace_id, ip, user_agent = get_request_meta(request)
+    updated = update_user_status(payload.username, payload.is_active)
+    if not updated:
+        log_event(
+            action="admin.user_disable_enable",
+            actor=user["username"],
+            role=user["role"],
+            status="failed",
+            metadata={"reason": "user_not_found", "target_username": payload.username},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise ApiError("VALIDATION_ERROR", "User not found.", status.HTTP_404_NOT_FOUND)
+
+    log_event(
+        action="admin.user_disable_enable",
+        actor=user["username"],
+        role=user["role"],
+        status="success",
+        metadata={
+            "target_username": payload.username,
+            "is_active": payload.is_active,
+        },
+        trace_id=trace_id,
+        ip=ip,
+        user_agent=user_agent,
+        ts=iso_now(),
+    )
+    return {"status": "success"}
+
+
+@app.post("/admin/users/reset-password")
+def reset_password(
+    payload: PasswordResetRequest, request: Request, user=Depends(require_admin)
+):
+    trace_id, ip, user_agent = get_request_meta(request)
+    password_hash = hash_password(payload.new_password)
+    updated = update_user_password(payload.username, password_hash)
+    if not updated:
+        log_event(
+            action="admin.password_reset",
+            actor=user["username"],
+            role=user["role"],
+            status="failed",
+            metadata={"reason": "user_not_found", "target_username": payload.username},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise ApiError("VALIDATION_ERROR", "User not found.", status.HTTP_404_NOT_FOUND)
+
+    log_event(
+        action="admin.password_reset",
+        actor=user["username"],
+        role=user["role"],
+        status="success",
+        metadata={"target_username": payload.username},
+        trace_id=trace_id,
+        ip=ip,
+        user_agent=user_agent,
+        ts=iso_now(),
+    )
+    return {"status": "success"}
 
 
 @app.post("/tasks", response_model=TaskCreateResponse)
-def create_task(request: TaskCreateRequest, user=Depends(require_auth)):
-    if request.works_completed > request.number_of_works:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Works completed cannot exceed number of works.",
+def create_task(payload: TaskCreateRequest, request: Request, user=Depends(require_auth)):
+    trace_id, ip, user_agent = get_request_meta(request)
+    try:
+        if payload.works_completed > payload.number_of_works:
+            raise ApiError(
+                "VALIDATION_ERROR",
+                "Works completed cannot exceed number of works.",
+                status.HTTP_400_BAD_REQUEST,
+            )
+
+        balance_amount = payload.agreement_amount - payload.exp_upto_31_03_2025
+        if balance_amount < 0:
+            raise ApiError(
+                "VALIDATION_ERROR",
+                "Balance amount as on 01-04-2025 cannot be negative.",
+                status.HTTP_400_BAD_REQUEST,
+            )
+
+        total_exp_during_year = payload.exp_upto_last_month + payload.exp_during_this_month
+        total_value_work_done = payload.exp_upto_31_03_2025 + total_exp_during_year
+        balance_works = payload.number_of_works - payload.works_completed
+
+        created_at = iso_now()
+        task_data = {
+            "sub_division": payload.sub_division,
+            "account_code": payload.account_code,
+            "number_of_works": payload.number_of_works,
+            "estimate_amount": payload.estimate_amount,
+            "agreement_amount": payload.agreement_amount,
+            "exp_upto_31_03_2025": payload.exp_upto_31_03_2025,
+            "balance_amount_as_on_01_04_2025": balance_amount,
+            "exp_upto_last_month": payload.exp_upto_last_month,
+            "exp_during_this_month": payload.exp_during_this_month,
+            "total_exp_during_year": total_exp_during_year,
+            "total_value_work_done_from_beginning": total_value_work_done,
+            "works_completed": payload.works_completed,
+            "balance_works": balance_works,
+            "created_by": user["username"],
+            "created_at": created_at,
+        }
+
+        sno = append_task(task_data)
+
+        log_event(
+            action="tasks.create_success",
+            actor=user["username"],
+            role=user["role"],
+            status="success",
+            metadata={"sno": sno},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
         )
 
-    balance_amount = request.agreement_amount - request.exp_upto_31_03_2025
-    if balance_amount < 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Balance amount as on 01-04-2025 cannot be negative.",
+        return TaskCreateResponse(
+            status="success",
+            sno=sno,
+            created_at=created_at,
+            computed=ComputedFields(
+                balance_amount_as_on_01_04_2025=balance_amount,
+                total_exp_during_year=total_exp_during_year,
+                total_value_work_done_from_beginning=total_value_work_done,
+                balance_works=balance_works,
+            ),
         )
-
-    total_exp_during_year = request.exp_upto_last_month + request.exp_during_this_month
-    total_value_work_done = request.exp_upto_31_03_2025 + total_exp_during_year
-    balance_works = request.number_of_works - request.works_completed
-
-    created_at = iso_now()
-    task_data = {
-        "sub_division": request.sub_division,
-        "account_code": request.account_code,
-        "number_of_works": request.number_of_works,
-        "estimate_amount": request.estimate_amount,
-        "agreement_amount": request.agreement_amount,
-        "exp_upto_31_03_2025": request.exp_upto_31_03_2025,
-        "balance_amount_as_on_01_04_2025": balance_amount,
-        "exp_upto_last_month": request.exp_upto_last_month,
-        "exp_during_this_month": request.exp_during_this_month,
-        "total_exp_during_year": total_exp_during_year,
-        "total_value_work_done_from_beginning": total_value_work_done,
-        "works_completed": request.works_completed,
-        "balance_works": balance_works,
-        "created_by": user["username"],
-        "created_at": created_at,
-    }
-
-    sno = append_task(task_data)
-
-    return TaskCreateResponse(
-        status="success",
-        sno=sno,
-        created_at=created_at,
-        computed=ComputedFields(
-            balance_amount_as_on_01_04_2025=balance_amount,
-            total_exp_during_year=total_exp_during_year,
-            total_value_work_done_from_beginning=total_value_work_done,
-            balance_works=balance_works,
-        ),
-    )
+    except ApiError:
+        log_event(
+            action="tasks.create_failed",
+            actor=user["username"],
+            role=user["role"],
+            status="failed",
+            metadata={"reason": "validation_error"},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise
+    except Exception as exc:
+        log_event(
+            action="tasks.create_failed",
+            actor=user["username"],
+            role=user["role"],
+            status="error",
+            metadata={"error": str(exc)},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise
 
 
 @app.get("/admin/tasks", response_model=AdminTasksResponse)
@@ -246,19 +550,17 @@ def get_tasks(
     page_size: int = Query(50, ge=1, le=500),
 ):
     if order not in ("asc", "desc"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid order.")
+        raise ApiError("VALIDATION_ERROR", "Invalid order.", status.HTTP_400_BAD_REQUEST)
     if account_code not in (None, "", "Spill", "New"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid account_code."
-        )
+        raise ApiError("VALIDATION_ERROR", "Invalid account_code.", status.HTTP_400_BAD_REQUEST)
 
     date_from_parsed = parse_date_param(date_from, is_end=False) if date_from else None
     if date_from and date_from_parsed is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date_from.")
+        raise ApiError("VALIDATION_ERROR", "Invalid date_from.", status.HTTP_400_BAD_REQUEST)
 
     date_to_parsed = parse_date_param(date_to, is_end=True) if date_to else None
     if date_to and date_to_parsed is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date_to.")
+        raise ApiError("VALIDATION_ERROR", "Invalid date_to.", status.HTTP_400_BAD_REQUEST)
 
     records = list_tasks()
     records = apply_filters(records, sub_division, account_code, date_from_parsed, date_to_parsed)
@@ -290,17 +592,15 @@ def get_summary(
     date_to: str | None = Query(None),
 ):
     if account_code not in (None, "", "Spill", "New"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid account_code."
-        )
+        raise ApiError("VALIDATION_ERROR", "Invalid account_code.", status.HTTP_400_BAD_REQUEST)
 
     date_from_parsed = parse_date_param(date_from, is_end=False) if date_from else None
     if date_from and date_from_parsed is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date_from.")
+        raise ApiError("VALIDATION_ERROR", "Invalid date_from.", status.HTTP_400_BAD_REQUEST)
 
     date_to_parsed = parse_date_param(date_to, is_end=True) if date_to else None
     if date_to and date_to_parsed is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date_to.")
+        raise ApiError("VALIDATION_ERROR", "Invalid date_to.", status.HTTP_400_BAD_REQUEST)
 
     records = list_tasks()
     records = apply_filters(records, sub_division, account_code, date_from_parsed, date_to_parsed)
@@ -348,6 +648,7 @@ def get_summary(
 
 @app.get("/admin/export")
 def export_tasks(
+    request: Request,
     user=Depends(require_admin),
     sort_by: str = Query("sno"),
     order: str = Query("asc"),
@@ -357,84 +658,121 @@ def export_tasks(
     date_to: str | None = Query(None),
 ):
     if order not in ("asc", "desc"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid order.")
+        raise ApiError("VALIDATION_ERROR", "Invalid order.", status.HTTP_400_BAD_REQUEST)
     if account_code not in (None, "", "Spill", "New"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid account_code."
-        )
+        raise ApiError("VALIDATION_ERROR", "Invalid account_code.", status.HTTP_400_BAD_REQUEST)
 
     date_from_parsed = parse_date_param(date_from, is_end=False) if date_from else None
     if date_from and date_from_parsed is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date_from.")
+        raise ApiError("VALIDATION_ERROR", "Invalid date_from.", status.HTTP_400_BAD_REQUEST)
 
     date_to_parsed = parse_date_param(date_to, is_end=True) if date_to else None
     if date_to and date_to_parsed is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date_to.")
+        raise ApiError("VALIDATION_ERROR", "Invalid date_to.", status.HTTP_400_BAD_REQUEST)
+
+    trace_id, ip, user_agent = get_request_meta(request)
 
     try:
-        copy_tasks_backup()
-    except Exception:
-        pass
-
-    records = list_tasks()
-    records = apply_filters(records, sub_division, account_code, date_from_parsed, date_to_parsed)
-    records = sort_records(records, sort_by, order)
-
-    from openpyxl import Workbook
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Export"
-    ws.append(TASK_COLUMNS)
-    for record in records:
-        ws.append([record.get(col, "") for col in TASK_COLUMNS])
-
-    ws.append([])
-    ws.append(["Grand Totals"])
-    ws.append(TASK_TOTAL_COLUMNS)
-    totals = compute_totals(records)
-    ws.append([totals.get(col, 0) for col in TASK_TOTAL_COLUMNS])
-
-    ws.append([])
-    ws.append(["Sub-Division Totals"])
-    ws.append(["sub_division", "account_code"] + TASK_TOTAL_COLUMNS)
-
-    grouped = {}
-    for record in records:
-        sub_key = record.get("sub_division") or ""
-        acct_key = record.get("account_code") or ""
-        group = grouped.setdefault(
-            sub_key,
-            {
-                "all": {key: 0 for key in TASK_TOTAL_COLUMNS},
-                "accounts": {},
-            },
+        run_export_backup()
+    except Exception as exc:
+        log_event(
+            action="admin.export_failed",
+            actor=user["username"],
+            role=user["role"],
+            status="failed",
+            metadata={"reason": "backup_failed", "error": str(exc)},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
         )
-        for key in TASK_TOTAL_COLUMNS:
-            group["all"][key] += record.get(key, 0) or 0
+        raise ApiError("INTERNAL_ERROR", "Backup failed before export.", status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        acct_totals = group["accounts"].setdefault(
-            acct_key, {key: 0 for key in TASK_TOTAL_COLUMNS}
-        )
-        for key in TASK_TOTAL_COLUMNS:
-            acct_totals[key] += record.get(key, 0) or 0
+    try:
+        records = list_tasks()
+        records = apply_filters(records, sub_division, account_code, date_from_parsed, date_to_parsed)
+        records = sort_records(records, sort_by, order)
 
-    for sub_div, data in sorted(grouped.items(), key=lambda item: item[0].lower()):
-        ws.append(
-            [sub_div, "All"] + [data["all"].get(col, 0) for col in TASK_TOTAL_COLUMNS]
-        )
-        for acct_code in sorted(data["accounts"].keys()):
-            totals_row = data["accounts"][acct_code]
-            ws.append(
-                [sub_div, acct_code]
-                + [totals_row.get(col, 0) for col in TASK_TOTAL_COLUMNS]
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Export"
+        ws.append(TASK_COLUMNS)
+        for record in records:
+            ws.append([record.get(col, "") for col in TASK_COLUMNS])
+
+        ws.append([])
+        ws.append(["Grand Totals"])
+        ws.append(TASK_TOTAL_COLUMNS)
+        totals = compute_totals(records)
+        ws.append([totals.get(col, 0) for col in TASK_TOTAL_COLUMNS])
+
+        ws.append([])
+        ws.append(["Sub-Division Totals"])
+        ws.append(["sub_division", "account_code"] + TASK_TOTAL_COLUMNS)
+
+        grouped = {}
+        for record in records:
+            sub_key = record.get("sub_division") or ""
+            acct_key = record.get("account_code") or ""
+            group = grouped.setdefault(
+                sub_key,
+                {
+                    "all": {key: 0 for key in TASK_TOTAL_COLUMNS},
+                    "accounts": {},
+                },
             )
+            for key in TASK_TOTAL_COLUMNS:
+                group["all"][key] += record.get(key, 0) or 0
 
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-    filename = f"tasks_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    headers = {"Content-Disposition": f"attachment; filename={filename}"}
+            acct_totals = group["accounts"].setdefault(
+                acct_key, {key: 0 for key in TASK_TOTAL_COLUMNS}
+            )
+            for key in TASK_TOTAL_COLUMNS:
+                acct_totals[key] += record.get(key, 0) or 0
+
+        for sub_div, data in sorted(grouped.items(), key=lambda item: item[0].lower()):
+            ws.append(
+                [sub_div, "All"] + [data["all"].get(col, 0) for col in TASK_TOTAL_COLUMNS]
+            )
+            for acct_code in sorted(data["accounts"].keys()):
+                totals_row = data["accounts"][acct_code]
+                ws.append(
+                    [sub_div, acct_code]
+                    + [totals_row.get(col, 0) for col in TASK_TOTAL_COLUMNS]
+                )
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        filename = f"tasks_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        headers = {"Content-Disposition": f"attachment; filename={filename}"}
+    except Exception as exc:
+        log_event(
+            action="admin.export_failed",
+            actor=user["username"],
+            role=user["role"],
+            status="error",
+            metadata={"error": str(exc)},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise
+
+    log_event(
+        action="admin.export_success",
+        actor=user["username"],
+        role=user["role"],
+        status="success",
+        metadata={"total_items": len(records)},
+        trace_id=trace_id,
+        ip=ip,
+        user_agent=user_agent,
+        ts=iso_now(),
+    )
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

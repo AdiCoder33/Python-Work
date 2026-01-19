@@ -4,3 +4,4 @@ openpyxl
 passlib[bcrypt]
 python-jose[cryptography]
 filelock
+bcrypt<4

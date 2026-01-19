@@ -81,6 +81,13 @@ def extract_error_message(raw_text):
     except json.JSONDecodeError:
         return raw_text
     if isinstance(payload, dict):
+        error = payload.get("error")
+        trace_id = payload.get("trace_id")
+        if isinstance(error, dict):
+            message = error.get("message") or "Request failed."
+            if trace_id:
+                return f"{message} (trace: {trace_id})"
+            return message
         detail = payload.get("detail")
         if isinstance(detail, list):
             messages = [item.get("msg", "") for item in detail if isinstance(item, dict)]
