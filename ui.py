@@ -10,7 +10,7 @@ from config_loader import load_subdivisions, load_templates
 from validation import format_float, parse_float, parse_int, validate_values
 
 
-API_BASE_URL = os.getenv("CAPITAL_WORKS_API", "http://localhost:8000")
+API_BASE_URL = "http://3.27.231.143:8000"
 
 
 FORM_COLUMN_DEFS = [
