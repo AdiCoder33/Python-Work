@@ -115,14 +115,21 @@ export default function UserTaskClient() {
     const works = toNumber(form.number_of_works);
     const completed = toNumber(form.works_completed);
 
+    const agreementValue = Number.isFinite(agreement) ? agreement : null;
+    const exp31Value = Number.isFinite(exp31) ? exp31 : null;
+    const expLastValue = Number.isFinite(expLast) ? expLast : null;
+    const expThisValue = Number.isFinite(expThis) ? expThis : null;
+    const worksValue = Number.isFinite(works) ? works : null;
+    const completedValue = Number.isFinite(completed) ? completed : null;
+
     const balanceAmount =
-      Number.isFinite(agreement) && Number.isFinite(exp31) ? agreement - exp31 : null;
+      agreementValue !== null && exp31Value !== null ? agreementValue - exp31Value : null;
     const totalYear =
-      Number.isFinite(expLast) && Number.isFinite(expThis) ? expLast + expThis : null;
+      expLastValue !== null && expThisValue !== null ? expLastValue + expThisValue : null;
     const totalValue =
-      Number.isFinite(exp31) && Number.isFinite(totalYear) ? exp31 + totalYear : null;
+      exp31Value !== null && totalYear !== null ? exp31Value + totalYear : null;
     const balanceWorks =
-      Number.isFinite(works) && Number.isFinite(completed) ? works - completed : null;
+      worksValue !== null && completedValue !== null ? worksValue - completedValue : null;
 
     return {
       balanceAmount,

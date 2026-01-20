@@ -2,7 +2,13 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-const numericFields = [
+type NumericField = {
+  key: string;
+  label: string;
+  type: "int" | "float";
+};
+
+const numericFields: NumericField[] = [
   { key: "number_of_works", label: "Number of Works", type: "int" },
   { key: "estimate_amount", label: "Estimate Amount", type: "float" },
   { key: "agreement_amount", label: "Agreement Amount", type: "float" },

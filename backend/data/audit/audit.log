@@ -6,3 +6,4 @@
 {"ts":"2026-01-20T20:43:48.330315+00:00","action":"tasks.create_success","actor":"naruto@gmail.com","role":"user","status":"success","metadata":{"sno":1},"trace_id":"81485cb8-1f2c-4e0b-9d31-1a0ad8c5b039","ip":"127.0.0.1","user_agent":"node"}
 {"ts":"2026-01-20T20:46:21.413845+00:00","action":"tasks.update_success","actor":"naruto@gmail.com","role":"user","status":"success","metadata":{"sno":1},"trace_id":"f2762f9e-456d-42b6-8b9c-4c2f811969ca","ip":"127.0.0.1","user_agent":"node"}
 {"ts":"2026-01-20T20:46:26.936307+00:00","action":"tasks.delete_success","actor":"naruto@gmail.com","role":"user","status":"success","metadata":{"sno":1},"trace_id":"a97bfe70-83db-4423-ba06-36a91d2934d9","ip":"127.0.0.1","user_agent":"node"}
+{"ts":"2026-01-20T22:02:51.530044+00:00","action":"auth.login_success","actor":"naruto@gmail.com","role":"user","status":"success","metadata":{},"trace_id":"f9b6202a-d90d-4ab3-a781-e51bf91e3834","ip":"127.0.0.1","user_agent":"node"}
