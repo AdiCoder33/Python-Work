@@ -1,0 +1,16 @@
+{
+  "templates": {
+    "Blank": {},
+    "Spill Default": {
+      "account_code": "Spill"
+    },
+    "New Default": {
+      "account_code": "New"
+    },
+    "Monthly Repeat": {
+      "exp_upto_last_month": "0",
+      "exp_during_this_month": "0",
+      "works_completed": "0"
+    }
+  }
+}

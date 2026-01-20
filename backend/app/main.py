@@ -15,11 +15,14 @@ from .deps import require_admin, require_auth
 from .excel_store import (
     append_task,
     append_user,
+    delete_task,
     ensure_tasks_file,
     ensure_users_file,
+    get_task_by_sno,
     find_user,
     list_users,
     list_tasks,
+    update_task,
     update_last_login,
     update_user_password,
     update_user_status,
@@ -39,7 +42,9 @@ from .models import (
     SummaryResponse,
     TaskCreateRequest,
     TaskCreateResponse,
+    TaskDeleteResponse,
     TaskRecord,
+    TaskUpdateRequest,
     Totals,
     TokenResponse,
     SubDivisionTotals,
@@ -230,6 +235,51 @@ def compute_totals(records):
         for key in TASK_TOTAL_COLUMNS:
             totals[key] += record.get(key, 0) or 0
     return totals
+
+
+def compute_task_fields(payload):
+    if payload.works_completed > payload.number_of_works:
+        raise ApiError(
+            "VALIDATION_ERROR",
+            "Works completed cannot exceed number of works.",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    balance_amount = payload.agreement_amount - payload.exp_upto_31_03_2025
+    if balance_amount < 0:
+        raise ApiError(
+            "VALIDATION_ERROR",
+            "Balance amount as on 01-04-2025 cannot be negative.",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    total_exp_during_year = payload.exp_upto_last_month + payload.exp_during_this_month
+    total_value_work_done = payload.exp_upto_31_03_2025 + total_exp_during_year
+    balance_works = payload.number_of_works - payload.works_completed
+    return balance_amount, total_exp_during_year, total_value_work_done, balance_works
+
+
+def build_task_row(payload, created_by, created_at):
+    balance_amount, total_exp_during_year, total_value_work_done, balance_works = compute_task_fields(
+        payload
+    )
+    return {
+        "sub_division": payload.sub_division,
+        "account_code": payload.account_code,
+        "number_of_works": payload.number_of_works,
+        "estimate_amount": payload.estimate_amount,
+        "agreement_amount": payload.agreement_amount,
+        "exp_upto_31_03_2025": payload.exp_upto_31_03_2025,
+        "balance_amount_as_on_01_04_2025": balance_amount,
+        "exp_upto_last_month": payload.exp_upto_last_month,
+        "exp_during_this_month": payload.exp_during_this_month,
+        "total_exp_during_year": total_exp_during_year,
+        "total_value_work_done_from_beginning": total_value_work_done,
+        "works_completed": payload.works_completed,
+        "balance_works": balance_works,
+        "created_by": created_by,
+        "created_at": created_at,
+    }
 
 
 def totals_to_model(data):
@@ -462,43 +512,12 @@ def reset_password(
 def create_task(payload: TaskCreateRequest, request: Request, user=Depends(require_auth)):
     trace_id, ip, user_agent = get_request_meta(request)
     try:
-        if payload.works_completed > payload.number_of_works:
-            raise ApiError(
-                "VALIDATION_ERROR",
-                "Works completed cannot exceed number of works.",
-                status.HTTP_400_BAD_REQUEST,
-            )
-
-        balance_amount = payload.agreement_amount - payload.exp_upto_31_03_2025
-        if balance_amount < 0:
-            raise ApiError(
-                "VALIDATION_ERROR",
-                "Balance amount as on 01-04-2025 cannot be negative.",
-                status.HTTP_400_BAD_REQUEST,
-            )
-
-        total_exp_during_year = payload.exp_upto_last_month + payload.exp_during_this_month
-        total_value_work_done = payload.exp_upto_31_03_2025 + total_exp_during_year
-        balance_works = payload.number_of_works - payload.works_completed
-
         created_at = iso_now()
-        task_data = {
-            "sub_division": payload.sub_division,
-            "account_code": payload.account_code,
-            "number_of_works": payload.number_of_works,
-            "estimate_amount": payload.estimate_amount,
-            "agreement_amount": payload.agreement_amount,
-            "exp_upto_31_03_2025": payload.exp_upto_31_03_2025,
-            "balance_amount_as_on_01_04_2025": balance_amount,
-            "exp_upto_last_month": payload.exp_upto_last_month,
-            "exp_during_this_month": payload.exp_during_this_month,
-            "total_exp_during_year": total_exp_during_year,
-            "total_value_work_done_from_beginning": total_value_work_done,
-            "works_completed": payload.works_completed,
-            "balance_works": balance_works,
-            "created_by": user["username"],
-            "created_at": created_at,
-        }
+        task_data = build_task_row(payload, user["username"], created_at)
+        balance_amount = task_data["balance_amount_as_on_01_04_2025"]
+        total_exp_during_year = task_data["total_exp_during_year"]
+        total_value_work_done = task_data["total_value_work_done_from_beginning"]
+        balance_works = task_data["balance_works"]
 
         sno = append_task(task_data)
 
@@ -545,6 +564,166 @@ def create_task(payload: TaskCreateRequest, request: Request, user=Depends(requi
             role=user["role"],
             status="error",
             metadata={"error": str(exc)},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise
+
+
+@app.get("/tasks", response_model=AdminTasksResponse)
+def get_user_tasks(
+    user=Depends(require_auth),
+    sort_by: str = Query("sno"),
+    order: str = Query("asc"),
+    sub_division: str | None = Query(None),
+    account_code: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+):
+    if order not in ("asc", "desc"):
+        raise ApiError("VALIDATION_ERROR", "Invalid order.", status.HTTP_400_BAD_REQUEST)
+    if account_code not in (None, "", "Spill", "New"):
+        raise ApiError("VALIDATION_ERROR", "Invalid account_code.", status.HTTP_400_BAD_REQUEST)
+
+    date_from_parsed = parse_date_param(date_from, is_end=False) if date_from else None
+    if date_from and date_from_parsed is None:
+        raise ApiError("VALIDATION_ERROR", "Invalid date_from.", status.HTTP_400_BAD_REQUEST)
+
+    date_to_parsed = parse_date_param(date_to, is_end=True) if date_to else None
+    if date_to and date_to_parsed is None:
+        raise ApiError("VALIDATION_ERROR", "Invalid date_to.", status.HTTP_400_BAD_REQUEST)
+
+    records = list_tasks()
+    if user.get("role") != "admin":
+        records = [record for record in records if record.get("created_by") == user["username"]]
+
+    records = apply_filters(records, sub_division, account_code, date_from_parsed, date_to_parsed)
+    records = sort_records(records, sort_by, order)
+
+    total_items = len(records)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    if page > total_pages:
+        page = total_pages
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = records[start:end]
+
+    return AdminTasksResponse(
+        items=[TaskRecord(**item) for item in page_items],
+        page=page,
+        page_size=page_size,
+        total_items=total_items,
+        total_pages=total_pages,
+    )
+
+
+@app.patch("/tasks/{sno}", response_model=TaskRecord)
+def update_task_record(
+    sno: int, payload: TaskUpdateRequest, request: Request, user=Depends(require_auth)
+):
+    trace_id, ip, user_agent = get_request_meta(request)
+    existing = get_task_by_sno(sno)
+    if not existing:
+        raise ApiError("VALIDATION_ERROR", "Task not found.", status.HTTP_404_NOT_FOUND)
+    if user.get("role") != "admin" and existing.get("created_by") != user.get("username"):
+        raise ApiError("NOT_AUTHORIZED", "Not allowed to edit this task.", status.HTTP_403_FORBIDDEN)
+
+    try:
+        task_data = build_task_row(payload, existing.get("created_by"), existing.get("created_at"))
+        updated = update_task(sno, task_data)
+        if not updated:
+            raise ApiError("VALIDATION_ERROR", "Task not found.", status.HTTP_404_NOT_FOUND)
+
+        log_event(
+            action="tasks.update_success",
+            actor=user["username"],
+            role=user["role"],
+            status="success",
+            metadata={"sno": sno},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        return TaskRecord(**updated)
+    except ApiError:
+        log_event(
+            action="tasks.update_failed",
+            actor=user["username"],
+            role=user["role"],
+            status="failed",
+            metadata={"sno": sno},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise
+    except Exception as exc:
+        log_event(
+            action="tasks.update_failed",
+            actor=user["username"],
+            role=user["role"],
+            status="error",
+            metadata={"sno": sno, "error": str(exc)},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise
+
+
+@app.delete("/tasks/{sno}", response_model=TaskDeleteResponse)
+def delete_task_record(sno: int, request: Request, user=Depends(require_auth)):
+    trace_id, ip, user_agent = get_request_meta(request)
+    existing = get_task_by_sno(sno)
+    if not existing:
+        raise ApiError("VALIDATION_ERROR", "Task not found.", status.HTTP_404_NOT_FOUND)
+    if user.get("role") != "admin" and existing.get("created_by") != user.get("username"):
+        raise ApiError("NOT_AUTHORIZED", "Not allowed to delete this task.", status.HTTP_403_FORBIDDEN)
+
+    try:
+        deleted = delete_task(sno)
+        if not deleted:
+            raise ApiError("VALIDATION_ERROR", "Task not found.", status.HTTP_404_NOT_FOUND)
+
+        log_event(
+            action="tasks.delete_success",
+            actor=user["username"],
+            role=user["role"],
+            status="success",
+            metadata={"sno": sno},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        return TaskDeleteResponse(status="success", sno=sno)
+    except ApiError:
+        log_event(
+            action="tasks.delete_failed",
+            actor=user["username"],
+            role=user["role"],
+            status="failed",
+            metadata={"sno": sno},
+            trace_id=trace_id,
+            ip=ip,
+            user_agent=user_agent,
+            ts=iso_now(),
+        )
+        raise
+    except Exception as exc:
+        log_event(
+            action="tasks.delete_failed",
+            actor=user["username"],
+            role=user["role"],
+            status="error",
+            metadata={"sno": sno, "error": str(exc)},
             trace_id=trace_id,
             ip=ip,
             user_agent=user_agent,

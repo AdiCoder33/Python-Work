@@ -39,6 +39,18 @@ class TaskCreateRequest(BaseModel):
     works_completed: int = Field(..., ge=0)
 
 
+class TaskUpdateRequest(BaseModel):
+    sub_division: str = Field(..., min_length=1)
+    account_code: Literal["Spill", "New"]
+    number_of_works: int = Field(..., ge=0)
+    estimate_amount: float = Field(..., ge=0)
+    agreement_amount: float = Field(..., ge=0)
+    exp_upto_31_03_2025: float = Field(..., ge=0)
+    exp_upto_last_month: float = Field(..., ge=0)
+    exp_during_this_month: float = Field(..., ge=0)
+    works_completed: int = Field(..., ge=0)
+
+
 class UserStatusRequest(BaseModel):
     is_active: int = Field(..., ge=0, le=1)
 
@@ -78,6 +90,11 @@ class TaskRecord(BaseModel):
     balance_works: int
     created_by: str
     created_at: str
+
+
+class TaskDeleteResponse(BaseModel):
+    status: str
+    sno: int
 
 
 class UserRecord(BaseModel):

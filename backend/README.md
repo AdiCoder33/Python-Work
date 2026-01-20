@@ -43,6 +43,19 @@ Then run the UI from the project root:
 python app.py
 ```
 
+## User task endpoints
+
+These endpoints require a valid JWT (user or admin).
+
+- `GET /tasks`
+  - Same query params as `/admin/tasks`
+  - Non-admin users only see their own records
+- `PATCH /tasks/{sno}`
+  - Body: same fields as task create
+  - Users can edit only their own records; admins can edit any
+- `DELETE /tasks/{sno}`
+  - Users can delete only their own records; admins can delete any
+
 ## Admin reporting endpoints (Phase 3)
 
 All admin endpoints require a valid admin JWT.

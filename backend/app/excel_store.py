@@ -299,6 +299,81 @@ def list_tasks():
         return records
 
 
+def get_task_by_sno(sno: int):
+    ensure_tasks_file()
+    with FileLock(str(TASKS_LOCK)):
+        wb = load_workbook(TASKS_FILE)
+        ws = wb["tasks"]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not any(row):
+                continue
+            try:
+                if int(row[0]) != sno:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            row_data = dict(zip(TASK_COLUMNS, row))
+            return _normalize_task_row(row_data)
+    return None
+
+
+def _find_task_row(ws, sno: int):
+    for row in range(2, ws.max_row + 1):
+        value = ws.cell(row=row, column=1).value
+        if value is None or value == "":
+            continue
+        try:
+            if int(value) == sno:
+                return row
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def update_task(sno: int, task_data: dict):
+    ensure_tasks_file()
+    with FileLock(str(TASKS_LOCK)):
+        wb = load_workbook(TASKS_FILE)
+        ws = wb["tasks"]
+        row_index = _find_task_row(ws, sno)
+        if not row_index:
+            return None
+
+        row_values = [
+            ws.cell(row=row_index, column=col_index).value
+            for col_index in range(1, len(TASK_COLUMNS) + 1)
+        ]
+        existing = dict(zip(TASK_COLUMNS, row_values))
+        updated = dict(existing)
+        updated.update(task_data)
+        updated["sno"] = sno
+
+        for col_index, col_name in enumerate(TASK_COLUMNS, start=1):
+            ws.cell(row=row_index, column=col_index).value = updated.get(col_name, "")
+
+        safe_save_workbook(wb, TASKS_FILE)
+        return _normalize_task_row(updated)
+
+
+def delete_task(sno: int):
+    ensure_tasks_file()
+    with FileLock(str(TASKS_LOCK)):
+        wb = load_workbook(TASKS_FILE)
+        ws = wb["tasks"]
+        row_index = _find_task_row(ws, sno)
+        if not row_index:
+            return None
+
+        row_values = [
+            ws.cell(row=row_index, column=col_index).value
+            for col_index in range(1, len(TASK_COLUMNS) + 1)
+        ]
+        ws.delete_rows(row_index, 1)
+        safe_save_workbook(wb, TASKS_FILE)
+        row_data = dict(zip(TASK_COLUMNS, row_values))
+        return _normalize_task_row(row_data)
+
+
 def copy_tasks_backup(backup_path: Path | None = None):
     ensure_tasks_file()
     if backup_path is None:
