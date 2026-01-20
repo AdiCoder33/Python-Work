@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 type RouteContext = {
-  params: { username: string };
+  params: Promise<{ username: string }>;
 };
 
 export async function PATCH(request: Request, context: RouteContext) {
@@ -20,9 +20,10 @@ export async function PATCH(request: Request, context: RouteContext) {
   }
 
   const payload = await request.json().catch(() => null);
-  const username = encodeURIComponent(context.params.username);
+  const { username } = await context.params;
+  const encodedUsername = encodeURIComponent(username);
   const response = await forwardRequest({
-    path: `/admin/users/${username}/status`,
+    path: `/admin/users/${encodedUsername}/status`,
     method: "PATCH",
     body: payload,
     token,

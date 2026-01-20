@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 type RouteContext = {
-  params: { sno: string };
+  params: Promise<{ sno: string }>;
 };
 
 export async function PATCH(request: Request, context: RouteContext) {
@@ -20,8 +20,9 @@ export async function PATCH(request: Request, context: RouteContext) {
   }
 
   const payload = await request.json().catch(() => null);
+  const { sno } = await context.params;
   const response = await forwardRequest({
-    path: `/tasks/${encodeURIComponent(context.params.sno)}`,
+    path: `/tasks/${encodeURIComponent(sno)}`,
     method: "PATCH",
     body: payload,
     token,
@@ -40,8 +41,9 @@ export async function DELETE(_request: Request, context: RouteContext) {
     );
   }
 
+  const { sno } = await context.params;
   const response = await forwardRequest({
-    path: `/tasks/${encodeURIComponent(context.params.sno)}`,
+    path: `/tasks/${encodeURIComponent(sno)}`,
     method: "DELETE",
     token,
   });
